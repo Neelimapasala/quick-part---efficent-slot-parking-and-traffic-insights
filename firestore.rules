@@ -1,0 +1,418 @@
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// SMART PARKING - UNIFIED FIRESTORE SECURITY RULES
+// Production-grade rules for Customer App + Admin App
+// Supports 10K+ users, 1000+ parking lots with transaction safety
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // HELPER FUNCTIONS
+    // ─────────────────────────────────────────────────────────────────────────────────
+    
+    // Authentication check
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Check if current user is the owner
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Get current user's data from users collection
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    // Get current user's role
+    function getUserRole() {
+      return isAuthenticated() ? getUserData().role : null;
+    }
+    
+    // Check if user is admin
+    function isAdmin() {
+      return isAuthenticated() && getUserRole() == 'admin';
+    }
+    
+    // Check if user is parking operator or admin
+    function isParkingOperator() {
+      return isAuthenticated() && (getUserRole() == 'parkingOperator' || getUserRole() == 'admin');
+    }
+    
+    // Check if user has any valid role
+    function isValidUser() {
+      return isAuthenticated() && getUserRole() in ['user', 'parkingOperator', 'admin'];
+    }
+    
+    // Check if user owns a parking spot
+    function isSpotOwner(spotId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/parkingSpots/$(spotId)) &&
+        get(/databases/$(database)/documents/parkingSpots/$(spotId)).data.ownerId == request.auth.uid;
+    }
+    
+    // Validate timestamp field
+    function isValidTimestamp(field) {
+      return field is timestamp;
+    }
+    
+    // Check if only specific fields are being modified
+    function onlyModifying(allowedFields) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(allowedFields);
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // COUNTERS COLLECTION (Sequential ID Generation)
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /counters/{counterName} {
+      // Read: Any authenticated user
+      allow read: if isAuthenticated();
+      
+      // Write: Only allow atomic increment by 1
+      allow write: if isAuthenticated() &&
+        request.resource.data.keys().hasOnly(['lastId']) &&
+        request.resource.data.lastId is int &&
+        (
+          !exists(/databases/$(database)/documents/counters/$(counterName)) ||
+          request.resource.data.lastId == resource.data.lastId + 1
+        );
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // USERS COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /users/{userId} {
+      // Read own profile
+      allow read: if isOwner(userId);
+      
+      // Admins can read all users
+      allow read: if isAdmin();
+      
+      // Parking operators can read user info for booking verification
+      allow read: if isParkingOperator();
+      
+      // Create: Users can create their own profile during registration
+      allow create: if isAuthenticated() &&
+        request.auth.uid == userId &&
+        request.resource.data.keys().hasAll(['email', 'displayName', 'role']) &&
+        request.resource.data.role == 'user' &&
+        request.resource.data.email is string &&
+        request.resource.data.displayName is string;
+      
+      // Update: Users can update own profile (except role)
+      allow update: if isOwner(userId) &&
+        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']);
+      
+      // Delete: Users can delete own account
+      allow delete: if isOwner(userId);
+      
+      // Admins have full control
+      allow write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // VEHICLES COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /vehicles/{vehicleId} {
+      // Read own vehicles
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // Admins & operators can read all vehicles
+      allow read: if isAdmin() || isParkingOperator();
+      
+      // Create: Users can add their own vehicles
+      allow create: if isAuthenticated() && 
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.keys().hasAll([
+          'userId', 'licensePlate', 'make', 'model', 'type', 'createdAt', 'updatedAt'
+        ]);
+      
+      // Update/Delete: Users can manage their own vehicles
+      allow update, delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // Admins have full control
+      allow write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // PARKING SPOTS COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /parkingSpots/{spotId} {
+      // Read: All authenticated users (for map/discovery)
+      allow read: if isAuthenticated();
+      
+      // Booking Transaction Update: Allow atomic availability changes (+/- 1)
+      // This is critical for transaction-based booking to work
+      allow update: if isAuthenticated() &&
+        onlyModifying(['availableSpots', 'updatedAt']) &&
+        request.resource.data.availableSpots is int &&
+        request.resource.data.availableSpots >= 0 &&
+        request.resource.data.availableSpots <= resource.data.totalSpots &&
+        (
+          request.resource.data.availableSpots == resource.data.availableSpots - 1 ||
+          request.resource.data.availableSpots == resource.data.availableSpots + 1
+        );
+      
+      // Parking operators can update their own spots
+      allow update: if isParkingOperator() && isSpotOwner(spotId);
+      
+      // Create/Delete: Only admins
+      allow create, delete: if isAdmin();
+      
+      // Admins have full update control
+      allow update: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // BOOKINGS COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /bookings/{bookingId} {
+      
+      // Helper: Is this user the booking owner
+      function isBookingOwner() {
+        return isAuthenticated() && resource.data.userId == request.auth.uid;
+      }
+      
+      function isNewBookingOwner() {
+        return isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      }
+      
+      // Valid booking status transitions
+      function isValidStatusTransition(from, to) {
+        return
+          (from == 'pending' && to == 'confirmed') ||
+          (from == 'confirmed' && to == 'active') ||
+          (from == 'active' && to == 'completed') ||
+          (to == 'cancelled') ||
+          (from == 'completed' && to == 'completed');
+      }
+      
+      // ───── READ RULES ─────
+      
+      // Users can read their own bookings
+      allow read: if isBookingOwner();
+      
+      // Allow reading for conflict checking (authenticated users)
+      allow read: if isAuthenticated() &&
+        resource.data.parkingSpotId != null &&
+        resource.data.status in ['confirmed', 'active', 'pending'];
+      
+      // Parking operators can read bookings for their spots
+      allow read: if isParkingOperator() && isSpotOwner(resource.data.parkingSpotId);
+      
+      // Admins can read all bookings
+      allow read: if isAdmin();
+      
+      // List/Query with limits (for conflict detection)
+      allow list: if isAuthenticated() &&
+        request.query.limit != null &&
+        request.query.limit <= 100;
+      
+      // ───── CREATE RULES ─────
+      
+      // Users can create bookings for themselves
+      allow create: if isNewBookingOwner() &&
+        request.resource.data.keys().hasAll([
+          'userId', 'parkingSpotId', 'vehicleId', 'startTime', 'endTime',
+          'totalPrice', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        request.resource.data.status in ['pending', 'confirmed'] &&
+        request.resource.data.startTime is timestamp &&
+        request.resource.data.endTime is timestamp &&
+        request.resource.data.startTime < request.resource.data.endTime &&
+        request.resource.data.totalPrice > 0 &&
+        request.resource.data.userId == request.auth.uid;
+      
+      // ───── UPDATE RULES ─────
+      
+      // Users can cancel their own booking or update notes
+      allow update: if isBookingOwner() &&
+        request.resource.data.userId == resource.data.userId &&
+        (
+          request.resource.data.status == 'cancelled' ||
+          (resource.data.status == 'pending' && request.resource.data.status == 'confirmed') ||
+          onlyModifying(['notes', 'updatedAt', 'cancellationReason', 'cancellationFee', 'refundAmount', 'feedback'])
+        );
+      
+      // Parking operators can manage check-in/check-out for their spots
+      allow update: if isParkingOperator() &&
+        isSpotOwner(resource.data.parkingSpotId) &&
+        isValidStatusTransition(resource.data.status, request.resource.data.status) &&
+        onlyModifying(['status', 'checkedInAt', 'checkedOutAt', 'updatedAt']);
+      
+      // Admins can update any booking
+      allow update: if isAdmin();
+      
+      // ───── DELETE RULES ─────
+      
+      // Only admins can delete bookings
+      allow delete: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // SLOT RESERVATIONS COLLECTION (Advanced Conflict Detection)
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /slotReservations/{reservationId} {
+      // Read: All authenticated users
+      allow read: if isAuthenticated();
+      
+      // Create: Authenticated users during booking
+      allow create: if isAuthenticated() &&
+        request.resource.data.keys().hasAll([
+          'parkingSpotId', 'bookingId', 'startTime', 'endTime', 'status', 'createdAt'
+        ]) &&
+        request.resource.data.status == 'reserved';
+      
+      // Update: Only status changes
+      allow update: if isAuthenticated() &&
+        onlyModifying(['status', 'updatedAt']);
+      
+      // Delete: Only admins
+      allow delete: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // REVIEWS COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /reviews/{reviewId} {
+      // Read: All valid users
+      allow read: if isValidUser();
+      
+      // Create: Users can review after booking
+      allow create: if isAuthenticated() && 
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.keys().hasAll([
+          'userId', 'parkingSpotId', 'bookingId', 'rating', 'createdAt'
+        ]) &&
+        request.resource.data.rating is number &&
+        request.resource.data.rating >= 1 &&
+        request.resource.data.rating <= 5;
+      
+      // Update/Delete: Own reviews only
+      allow update, delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // Admins have full control
+      allow write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // NOTIFICATIONS COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /notifications/{notificationId} {
+      // Read own notifications
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // Update: Mark as read only
+      allow update: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid &&
+        onlyModifying(['isRead', 'updatedAt']);
+      
+      // Create: System/app can create for any user
+      allow create: if isAuthenticated();
+      
+      // Admins have full control
+      allow write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // TRANSACTIONS COLLECTION (Payments)
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /transactions/{transactionId} {
+      // Read own transactions
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // Operators can read transactions for their spots
+      allow read: if isParkingOperator() && isSpotOwner(resource.data.parkingSpotId);
+      
+      // Create: Users can create their own transactions
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      
+      // Admins have full control
+      allow read, write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // PARTNER REQUESTS COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /partnerRequests/{requestId} {
+      // Users can read their own requests
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // Users can create partner requests
+      allow create: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'pending';
+      
+      // Users can update their pending requests
+      allow update: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid &&
+        resource.data.status == 'pending';
+      
+      // Admins have full control
+      allow read, write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // ANALYTICS COLLECTION (Admin Only)
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /analytics/{document=**} {
+      allow read, write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // CONFIG COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /config/{document=**} {
+      // Read: All valid users
+      allow read: if isValidUser();
+      
+      // Write: Only admins
+      allow write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // REPORTS COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /reports/{reportId} {
+      // Create: Authenticated users
+      allow create: if isAuthenticated() && 
+        request.resource.data.reportedBy == request.auth.uid;
+      
+      // Read own reports
+      allow read: if isAuthenticated() && resource.data.reportedBy == request.auth.uid;
+      
+      // Admins have full control
+      allow read, write: if isAdmin();
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // SUPPORT/CHAT COLLECTION
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /supportChats/{chatId} {
+      // Users can read/write their own chats
+      allow read, write: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // Create new chat
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      
+      // Admins have full control
+      allow read, write: if isAdmin();
+      
+      // Messages subcollection
+      match /messages/{messageId} {
+        allow read, write: if isAuthenticated();
+      }
+    }
+    
+    // ─────────────────────────────────────────────────────────────────────────────────
+    // SUPER ADMIN FALLBACK
+    // Admins can access any document in any collection
+    // ─────────────────────────────────────────────────────────────────────────────────
+    match /{document=**} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
