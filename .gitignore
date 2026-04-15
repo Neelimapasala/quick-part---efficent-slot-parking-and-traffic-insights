@@ -1,0 +1,52 @@
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build outputs
+build/
+dist/
+*.apk
+*.aab
+**/build/
+**/.dart_tool/
+**/.gradle/
+**/.cxx/
+*.dill
+*.cache.dill.track.dill
+
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+
+# Firebase
+GoogleService-Info.plist
+firebase-debug.log
+firestore-debug.log
+serviceAccountKey.json
+
+# Logs
+*.log
