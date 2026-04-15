@@ -1,7 +1,7 @@
-# Weather-based Parking Recommendation Module
-# Suggests optimal parking spots based on weather conditions
+# Number Plate Recognition Module
+# Automatic Number Plate Recognition (ANPR) for Smart Parking
 
-from .recommender import ParkingRecommender
-from .weather_api import WeatherService
+from .plate_detector import PlateDetector
+from .ocr_engine import OCREngine
 
-__all__ = ['ParkingRecommender', 'WeatherService']
+__all__ = ['PlateDetector', 'OCREngine']
